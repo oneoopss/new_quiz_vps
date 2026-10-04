@@ -1,0 +1,12 @@
+# Секреты
+.env
+
+# Данные (SQLite)
+data/
+backend/data/
+
+# Python
+__pycache__/
+*.pyc
+backend/.venv/
+.pytest_cache/

@@ -1,0 +1,15 @@
+[Unit]
+Description=AI-генератор квизов (FastAPI backend)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/quiz/backend
+EnvironmentFile=/opt/quiz/.env
+ExecStart=/opt/quiz/backend/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
