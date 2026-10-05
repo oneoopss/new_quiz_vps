@@ -166,6 +166,7 @@ async def run_generation_job(
     settings: Optional[Settings] = None,
     level: str = DEFAULT_LEVEL,
     timeout_override: Optional[float] = None,
+    workspace_id: str = "default",
 ) -> None:
     settings = settings or get_settings()
     counting = CountingProvider(provider or get_provider())
@@ -194,7 +195,8 @@ async def run_generation_job(
     try:
         store.update_job(job_id, status="running")
         await asyncio.wait_for(
-            _run_stages(store, kb, job_id, section_codes, count, counting, settings, level, counters),
+            _run_stages(store, kb, job_id, section_codes, count, counting, settings, level,
+                        counters, workspace_id),
             timeout=timeout,
         )
     except asyncio.CancelledError:
@@ -220,6 +222,7 @@ async def _run_stages(
     settings: Settings,
     level: str = DEFAULT_LEVEL,
     counters: dict | None = None,
+    workspace_id: str = "default",
 ) -> None:
     counters = counters if counters is not None else {}
     from .critic import critique
@@ -275,7 +278,7 @@ async def _run_stages(
     report.stage("plan", 1, "Планирование покрытия...")
     plan, note = await make_plan(
         provider, knowledge, count, level=level,
-        used_ids=store.used_knowledge_ids(),
+        used_ids=store.used_knowledge_ids(workspace_id),
     )
     store.log(job_id, "plan", f"План покрытия: {len(plan)} вопросов", {"note": note})
     if not plan:
@@ -283,7 +286,8 @@ async def _run_stages(
     report.advance(1)
 
     # 2. Генерация пачками (параллельно)
-    prev_questions = store.previous_questions_for([p["knowledge_id"] for p in plan])
+    prev_questions = store.previous_questions_for(
+        [p["knowledge_id"] for p in plan], workspace_id)
     bs = settings.generation_batch_size
     report.stage("generate", total=len(plan), message="Генерация вопросов...")
     raw_questions, gen_errors = await generate_questions(
@@ -364,7 +368,7 @@ async def _run_stages(
     # 4. Дубликаты (код + LLM tie-break)
     detector = DuplicateDetector(
         provider,
-        store.all_question_texts(exclude_job_id=job_id) + _reference_texts(),
+        store.all_question_texts(workspace_id, exclude_job_id=job_id) + _reference_texts(),
         high_threshold=settings.dedup_jaccard_threshold,
         review_threshold=settings.dedup_review_threshold,
     )
@@ -393,7 +397,8 @@ async def _run_stages(
         verdict = review.get("verdict", "accept")
         if verdict == "accept":
             question_ids.append(
-                store.insert_question(_build_record(q, review, job_id, knowledge_by_id)))
+                store.insert_question(_build_record(q, review, job_id, knowledge_by_id),
+                                      workspace_id))
             counters["critic_accepted"] += 1
         elif verdict == "repair":
             counters["critic_repaired"] += 1
@@ -433,7 +438,7 @@ async def _run_stages(
             else:
                 question_ids.append(store.insert_question(_build_record(
                     fixed, {"verdict": "repaired", "hard_issues": issues, "soft_notes": []},
-                    job_id, knowledge_by_id, status="repaired")))
+                    job_id, knowledge_by_id, status="repaired"), workspace_id))
                 counters["repair_fixed"] += 1
                 repaired_running += 1
                 store.log(job_id, "repair", f"Исправлен: {fixed.text[:80]}")
@@ -450,7 +455,7 @@ async def _run_stages(
     for topup_round in range(2):
         if len(question_ids) >= count:
             break
-        saved_ids = store.used_knowledge_ids()
+        saved_ids = store.used_knowledge_ids(workspace_id)
         pool = [
             it for it in knowledge
             if it["id"] not in saved_ids
@@ -472,7 +477,7 @@ async def _run_stages(
         if not candidates:
             continue
         detector2 = DuplicateDetector(
-            provider, store.all_question_texts() + _reference_texts(),
+            provider, store.all_question_texts(workspace_id) + _reference_texts(),
             high_threshold=settings.dedup_jaccard_threshold,
             review_threshold=settings.dedup_review_threshold,
         )
@@ -497,7 +502,7 @@ async def _run_stages(
                 final_review = {"verdict": "repaired",
                                 "hard_issues": review.get("hard_issues", []), "soft_notes": []}
             question_ids.append(store.insert_question(
-                _build_record(final_q, final_review, job_id, knowledge_by_id)))
+                _build_record(final_q, final_review, job_id, knowledge_by_id), workspace_id))
             counters["topup_added"] += 1
         store.log(job_id, "topup",
                   f"Добор (волна {topup_round + 1}): всего добавлено {counters['topup_added']}")

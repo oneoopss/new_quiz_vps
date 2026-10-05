@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS knowledge_items (
 CREATE TABLE IF NOT EXISTS questions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id INTEGER,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
     text TEXT NOT NULL,
     explanation TEXT NOT NULL DEFAULT '',
     options TEXT NOT NULL DEFAULT '[]',
@@ -68,6 +69,7 @@ CREATE TABLE IF NOT EXISTS questions (
 );
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL DEFAULT 'default',
     status TEXT NOT NULL DEFAULT 'queued',
     params TEXT NOT NULL DEFAULT '{}',
     progress TEXT NOT NULL DEFAULT '{}',
@@ -112,6 +114,8 @@ class Database:
             "ALTER TABLE knowledge_items ADD COLUMN depth TEXT NOT NULL DEFAULT 'standard'",
             "ALTER TABLE knowledge_items ADD COLUMN clause TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE knowledge_items ADD COLUMN questionable INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE questions ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default'",
+            "ALTER TABLE jobs ADD COLUMN workspace_id TEXT NOT NULL DEFAULT 'default'",
         ):
             try:
                 self._conn.execute(ddl)

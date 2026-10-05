@@ -5,7 +5,7 @@ import asyncio
 import json
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..db import get_db
@@ -16,40 +16,47 @@ from ..llm.provider import get_provider
 from ..models import GenerateRequest, RefreshRequest
 from ..store import Store
 from ..tasks import cancel_all, spawn
+from .deps import workspace_of
 
 router = APIRouter(prefix="/api", tags=["generate"])
 
 
 @router.post("/generate")
-async def start_generation(req: GenerateRequest) -> dict[str, Any]:
+async def start_generation(req: GenerateRequest, request: Request) -> dict[str, Any]:
+    ws = workspace_of(request)
     codes = list(req.section_codes) or ([req.section_code] if req.section_code else [])
     if not codes:
         raise HTTPException(status_code=400, detail="Выберите хотя бы одну категорию")
     store = Store(get_db())
     kb = KnowledgeBase(get_db())
     job_id = store.create_job(
-        {"type": "generate", "section_codes": codes, "count": req.count, "level": req.level})
+        {"type": "generate", "section_codes": codes, "count": req.count, "level": req.level},
+        workspace_id=ws)
     store.log(job_id, "api", f"Запуск генерации: категории {', '.join(codes)}, "
                              f"{req.count} вопросов, уровень {req.level}")
 
     async def _run() -> None:
-        await run_generation_job(store, kb, job_id, codes, req.count, level=req.level)
+        await run_generation_job(store, kb, job_id, codes, req.count, level=req.level,
+                                 workspace_id=ws)
 
-    spawn(job_id, _run())
+    spawn(job_id, _run(), ws)
     return {"job_id": job_id}
 
 
 @router.post("/jobs/cancel")
-async def cancel_jobs() -> dict[str, Any]:
-    """Останавливает ВСЕ фоновые процессы (извлечение, генерация, обновление, подготовку).
+async def cancel_jobs(request: Request) -> dict[str, Any]:
+    """Останавливает ВСЕ фоновые процессы СВОЕГО рабочего пространства.
 
     Уже сохранённые частичные вопросы остаются в базе; после остановки можно
-    сразу запускать заново.
+    сразу запускать заново. Чужие процессы не затрагиваются.
     """
-    cancelled = cancel_all()
+    ws = workspace_of(request)
+    cancelled = cancel_all(ws)
     # «Сгребаем» зависшие job-ы без живой задачи (например, после перезапуска сервера)
     store = Store(get_db())
-    for row in get_db().query("SELECT id FROM jobs WHERE status IN ('running', 'queued')"):
+    for row in get_db().query(
+        "SELECT id FROM jobs WHERE status IN ('running', 'queued') AND workspace_id = ?", (ws,)
+    ):
         if row["id"] not in cancelled:
             cancelled.append(row["id"])
         store.update_job(row["id"], status="cancelled", error="Остановлено пользователем")
@@ -58,31 +65,42 @@ async def cancel_jobs() -> dict[str, Any]:
 
 
 @router.get("/jobs/latest")
-def get_latest_job() -> dict[str, Any]:
-    """Последний job — для восстановления панели после обновления страницы."""
-    store = Store(get_db())
-    row = get_db().query_one("SELECT id FROM jobs ORDER BY id DESC LIMIT 1")
-    if not row:
+def get_latest_job(request: Request) -> dict[str, Any]:
+    """Последний job СВОЕГО рабочего пространства — для восстановления панели."""
+    job = Store(get_db()).latest_job(workspace_of(request))
+    if not job:
         raise HTTPException(status_code=404, detail="Job-ов ещё не было")
-    return store.get_job(row["id"])
+    return job
 
 
-@router.get("/jobs/{job_id}")
-def get_job(job_id: int) -> dict[str, Any]:
-    job = Store(get_db()).get_job(job_id)
+def _own_job_or_404(job_id: int, ws: str) -> dict[str, Any]:
+    store = Store(get_db())
+    if store.job_workspace(job_id) != ws:
+        raise HTTPException(status_code=404, detail="Job не найден")
+    job = store.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job не найден")
     return job
 
 
+@router.get("/jobs/{job_id}")
+def get_job(job_id: int, request: Request) -> dict[str, Any]:
+    return _own_job_or_404(job_id, workspace_of(request))
+
+
 @router.get("/jobs/{job_id}/logs")
-def get_job_logs(job_id: int) -> dict[str, Any]:
+def get_job_logs(job_id: int, request: Request) -> dict[str, Any]:
+    _own_job_or_404(job_id, workspace_of(request))
     return {"logs": Store(get_db()).job_logs(job_id)}
 
 
 @router.get("/jobs/{job_id}/stream")
-async def job_stream(job_id: int) -> StreamingResponse:
+async def job_stream(job_id: int, request: Request) -> StreamingResponse:
     """SSE с прогрессом job-а (фолбэк на фронте — polling /api/jobs/{id})."""
+    # EventSource не умеет передавать заголовки — workspace принимается и из query (?ws=)
+    ws = (request.headers.get("X-Workspace-Id") or request.query_params.get("ws")
+          or "default").strip() or "default"
+    _own_job_or_404(job_id, ws)
     store = Store(get_db())
 
     async def events():
@@ -107,11 +125,12 @@ async def job_stream(job_id: int) -> StreamingResponse:
 
 
 @router.post("/ingest")
-async def start_ingest(limit: int | None = None) -> dict[str, Any]:
+async def start_ingest(limit: int | None = None, request: Request = None) -> dict[str, Any]:
     """Фоновый ингест документации + извлечение знаний (с прогрессом и ETA)."""
+    ws = workspace_of(request) if request is not None else "default"
     store = Store(get_db())
     kb = KnowledgeBase(get_db())
-    job_id = store.create_job({"type": "ingest", "limit": limit})
+    job_id = store.create_job({"type": "ingest", "limit": limit}, workspace_id=ws)
     store.log(job_id, "api", "Запуск ингеста документации")
 
     async def _run() -> None:
@@ -131,12 +150,12 @@ async def start_ingest(limit: int | None = None) -> dict[str, Any]:
             store.update_job(job_id, status="failed", error=str(exc))
             store.log(job_id, "error", f"Ingest failed: {exc}")
 
-    spawn(job_id, _run())
+    spawn(job_id, _run(), ws)
     return {"job_id": job_id}
 
 
 @router.post("/ingest/prepare")
-async def prepare_documentation() -> dict[str, Any]:
+async def prepare_documentation(request: Request) -> dict[str, Any]:
     """Гибридная подготовка (одна кнопка).
 
     Фаза 1 — скачивание документации (быстро, бесплатно): сразу после неё
@@ -144,9 +163,10 @@ async def prepare_documentation() -> dict[str, Any]:
     Фаза 2 — фоновое извлечение знаний по всем категориям с прогрессом;
     генерация по выбранной категории работает и без её завершения.
     """
+    ws = workspace_of(request)
     store = Store(get_db())
     kb = KnowledgeBase(get_db())
-    job_id = store.create_job({"type": "prepare", "phase": "download"})
+    job_id = store.create_job({"type": "prepare", "phase": "download"}, workspace_id=ws)
     store.log(job_id, "api", "Подготовка документации: фаза 1 — скачивание")
 
     async def _run() -> None:
@@ -169,7 +189,7 @@ async def prepare_documentation() -> dict[str, Any]:
             return
 
         # Фаза 2: фоновое извлечение знаний (куратор может генерировать уже сейчас).
-        extract_job = store.create_job({"type": "extract", "phase": "knowledge"})
+        extract_job = store.create_job({"type": "extract", "phase": "knowledge"}, workspace_id=ws)
         store.log(extract_job, "api", "Подготовка документации: фаза 2 — извлечение знаний")
         er = ProgressReporter(store, extract_job, ["extract"], weights={"extract": 100})
         try:
@@ -188,13 +208,13 @@ async def prepare_documentation() -> dict[str, Any]:
             store.update_job(extract_job, status="failed", error=str(exc))
             store.log(extract_job, "error", f"Extract failed: {exc}")
 
-    spawn(job_id, _run())
+    spawn(job_id, _run(), ws)
     return {"job_id": job_id,
             "message": "Скачивание началось; извлечение знаний запустится после него"}
 
 
 @router.post("/ingest/refresh")
-async def refresh_knowledge(req: RefreshRequest) -> dict[str, Any]:
+async def refresh_knowledge(req: RefreshRequest, request: Request) -> dict[str, Any]:
     """Переизвлечение знаний выбранных категорий полным методом (без обрыва на 7 КБ).
 
     Сбрасывает старые знания разделов и извлекает их заново — для обновления
@@ -211,7 +231,9 @@ async def refresh_knowledge(req: RefreshRequest) -> dict[str, Any]:
                 expanded.append(d)
     if not expanded:
         raise HTTPException(status_code=404, detail="Разделы не найдены")
-    job_id = store.create_job({"type": "refresh", "section_codes": req.section_codes})
+    ws = workspace_of(request)
+    job_id = store.create_job({"type": "refresh", "section_codes": req.section_codes},
+                              workspace_id=ws)
     store.log(job_id, "api", f"Переизвлечение знаний: {', '.join(req.section_codes)}")
 
     async def _run() -> None:
@@ -239,5 +261,5 @@ async def refresh_knowledge(req: RefreshRequest) -> dict[str, Any]:
             store.update_job(job_id, status="failed", error=str(exc))
             store.log(job_id, "error", f"Refresh failed: {exc}")
 
-    spawn(job_id, _run())
+    spawn(job_id, _run(), ws)
     return {"job_id": job_id}

@@ -118,3 +118,16 @@ def seeded_kb(kb: KnowledgeBase):
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def make_request(workspace_id: str = "default"):
+    """Фейковый HTTP-запрос с заголовком X-Workspace-Id для вызова endpoint-ов напрямую."""
+    from fastapi import Request
+
+    return Request({
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "query_string": b"",
+        "headers": [(b"x-workspace-id", workspace_id.encode("utf-8"))],
+    })

@@ -115,14 +115,47 @@ def test_result_contains_loss_breakdown(seeded_kb, store):
 
 
 def test_jobs_latest_endpoint(store):
+    from .conftest import make_request
+
     with pytest.raises(HTTPException):
-        get_latest_job()  # job-ов ещё нет
+        get_latest_job(make_request())  # job-ов ещё нет
 
     first = store.create_job({"type": "generate", "section_codes": ["1.1"], "count": 1})
     second = store.create_job({"type": "ingest", "limit": None})
-    latest = get_latest_job()
+    latest = get_latest_job(make_request())
     assert latest["id"] == second
     assert latest["id"] != first
+
+
+def test_workspace_isolation(store):
+    """Рабочие пространства кураторов не пересекаются: вопросы, job-ы, отмена."""
+    from app.api.routes_generate import cancel_jobs
+    from app.models import OptionModel, QuestionRecord
+    from .conftest import make_request
+
+    qa = QuestionRecord(text="Вопрос куратора A", options=[OptionModel(text="В1", isCorrect=True)])
+    qb = QuestionRecord(text="Вопрос куратора B", options=[OptionModel(text="В1", isCorrect=True)])
+    store.insert_question(qa, workspace_id="curatorA")
+    store.insert_question(qb, workspace_id="curatorB")
+
+    # вопросы видны только своему куратору
+    assert store.all_question_texts("curatorA") == ["Вопрос куратора A"]
+    assert store.all_question_texts("curatorB") == ["Вопрос куратора B"]
+    # ротация знаний независима (у обоих своя история)
+    assert store.used_knowledge_ids("curatorA") == set()
+
+    ja = store.create_job({"type": "generate"}, workspace_id="curatorA")
+    jb = store.create_job({"type": "generate"}, workspace_id="curatorB")
+    assert store.latest_job("curatorA")["id"] == ja
+    assert store.latest_job("curatorB")["id"] == jb
+
+    # кнопка «стоп» не трогает чужие процессы
+    store.update_job(jb, status="running")
+    res = run(cancel_jobs(make_request("curatorA")))
+    assert ja in res["cancelled_job_ids"]
+    assert jb not in res["cancelled_job_ids"]
+    assert store.get_job(jb)["status"] == "running"
+    assert store.job_workspace(ja) == "curatorA"
 
 
 def test_failed_batch_reports_error_details(seeded_kb, store):
@@ -175,10 +208,11 @@ def test_cancel_stops_generation(seeded_kb, store):
 def test_cancel_endpoint_sweeps_stale_jobs(store):
     """Зависшие running-джобы без живой задачи тоже останавливаются — можно перезапускать."""
     from app.api.routes_generate import cancel_jobs
+    from .conftest import make_request
 
     jid = store.create_job({"type": "generate", "section_codes": ["1.1"], "count": 1})
     store.update_job(jid, status="running")
-    res = run(cancel_jobs())
+    res = run(cancel_jobs(make_request()))
     assert jid in res["cancelled_job_ids"]
     assert store.get_job(jid)["status"] == "cancelled"
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from ..db import get_db
 from ..generation.repairer import repair_question
@@ -11,8 +11,14 @@ from ..knowledge.base import KnowledgeBase
 from ..llm.provider import get_provider
 from ..models import QuestionUpdate, RepairRequest
 from ..store import Store
+from .deps import workspace_of
 
 router = APIRouter(prefix="/api/questions", tags=["questions"])
+
+
+def _own_question_or_404(question_id: int, ws: str) -> None:
+    if Store(get_db()).question_workspace(question_id) != ws:
+        raise HTTPException(status_code=404, detail="Вопрос не найден")
 
 
 def _serialize(q: Any) -> dict[str, Any]:
@@ -22,19 +28,24 @@ def _serialize(q: Any) -> dict[str, Any]:
 
 
 @router.get("")
-def list_questions(job_id: Optional[int] = None) -> dict[str, Any]:
+def list_questions(request: Request, job_id: Optional[int] = None) -> dict[str, Any]:
+    ws = workspace_of(request)
     store = Store(get_db())
     if job_id is not None:
+        if store.job_workspace(job_id) != ws:
+            raise HTTPException(status_code=404, detail="Job не найден")
         questions = store.questions_for_job(job_id)
     else:
-        rows = get_db().query("SELECT id FROM questions ORDER BY id DESC LIMIT 200")
+        rows = get_db().query(
+            "SELECT id FROM questions WHERE workspace_id = ? ORDER BY id DESC LIMIT 200", (ws,))
         questions = [store.get_question(r["id"]) for r in rows]
         questions = [q for q in questions if q]
     return {"questions": [_serialize(q) for q in questions]}
 
 
 @router.get("/{question_id}")
-def get_question(question_id: int) -> dict[str, Any]:
+def get_question(question_id: int, request: Request) -> dict[str, Any]:
+    _own_question_or_404(question_id, workspace_of(request))
     q = Store(get_db()).get_question(question_id)
     if not q:
         raise HTTPException(status_code=404, detail="Вопрос не найден")
@@ -42,7 +53,8 @@ def get_question(question_id: int) -> dict[str, Any]:
 
 
 @router.patch("/{question_id}")
-def update_question(question_id: int, upd: QuestionUpdate) -> dict[str, Any]:
+def update_question(question_id: int, upd: QuestionUpdate, request: Request) -> dict[str, Any]:
+    _own_question_or_404(question_id, workspace_of(request))
     store = Store(get_db())
     if not store.get_question(question_id):
         raise HTTPException(status_code=404, detail="Вопрос не найден")
@@ -60,7 +72,8 @@ def update_question(question_id: int, upd: QuestionUpdate) -> dict[str, Any]:
 
 
 @router.delete("/{question_id}")
-def delete_question(question_id: int) -> dict[str, Any]:
+def delete_question(question_id: int, request: Request) -> dict[str, Any]:
+    _own_question_or_404(question_id, workspace_of(request))
     store = Store(get_db())
     if not store.get_question(question_id):
         raise HTTPException(status_code=404, detail="Вопрос не найден")
@@ -69,7 +82,8 @@ def delete_question(question_id: int) -> dict[str, Any]:
 
 
 @router.post("/{question_id}/accept")
-def accept_question(question_id: int) -> dict[str, Any]:
+def accept_question(question_id: int, request: Request) -> dict[str, Any]:
+    _own_question_or_404(question_id, workspace_of(request))
     store = Store(get_db())
     if not store.get_question(question_id):
         raise HTTPException(status_code=404, detail="Вопрос не найден")
@@ -78,8 +92,9 @@ def accept_question(question_id: int) -> dict[str, Any]:
 
 
 @router.post("/{question_id}/repair")
-async def repair(question_id: int, req: RepairRequest) -> dict[str, Any]:
+async def repair(question_id: int, req: RepairRequest, request: Request) -> dict[str, Any]:
     """Перегенерация с учётом контекста вопроса и фидбека куратора (§22)."""
+    _own_question_or_404(question_id, workspace_of(request))
     store = Store(get_db())
     q = store.get_question(question_id)
     if not q:

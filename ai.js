@@ -18,6 +18,23 @@
         pollTimer: null
     };
 
+    // ---------- рабочее пространство куратора ----------
+    // sessionStorage: каждая сессия браузера (вкладка) начинается с чистого
+    // пространства — кураторы не видят вопросы друг друга даже на одном компьютере.
+    // Обновление страницы посреди работы пространство не теряет.
+    function getWorkspaceId() {
+        var id = '';
+        try { id = sessionStorage.getItem('quizWorkspaceId') || ''; } catch (e) { /* private mode */ }
+        if (!id) {
+            id = (window.crypto && window.crypto.randomUUID)
+                ? window.crypto.randomUUID()
+                : 'ws-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+            try { sessionStorage.setItem('quizWorkspaceId', id); } catch (e) { /* ignore */ }
+        }
+        return id;
+    }
+    var workspaceId = getWorkspaceId();
+
     // ---------- утилиты ----------
     function el(tag, className, text) {
         var node = document.createElement(tag);
@@ -41,6 +58,7 @@
             options.body = JSON.stringify(options.body);
             options.headers = Object.assign({ 'Content-Type': 'application/json' }, options.headers || {});
         }
+        options.headers = Object.assign({ 'X-Workspace-Id': workspaceId }, options.headers || {});
         return fetch(path, options).then(function(resp) {
             return resp.json().catch(function() { return {}; }).then(function(body) {
                 if (!resp.ok) {
@@ -124,6 +142,21 @@
         refreshBtn.id = 'aiRefreshBtn';
         refreshBtn.type = 'button';
         panel.appendChild(refreshBtn);
+
+        // Рабочее пространство: личные вопросы/job-ы каждого куратора не пересекаются
+        var wsLine = el('div');
+        wsLine.style.cssText = 'font-size:.82rem;color:var(--text-secondary);margin-bottom:.9rem;';
+        wsLine.innerHTML = 'Рабочее пространство: <b>…' + escapeText(workspaceId.slice(-4)) + '</b> ';
+        var switchWsBtn = el('button', 'ai-secondary-link', 'Сменить');
+        switchWsBtn.type = 'button';
+        switchWsBtn.addEventListener('click', function() {
+            if (!window.confirm('Начать с чистого листа? Текущие вопросы и черновик квиза ' +
+                'останутся позади и не будут показаны снова.')) return;
+            try { sessionStorage.removeItem('quizWorkspaceId'); } catch (e) { /* ignore */ }
+            window.location.reload();
+        });
+        wsLine.appendChild(switchWsBtn);
+        panel.appendChild(wsLine);
 
         var groupSection = el('div', 'form-group');
         groupSection.appendChild(el('label', 'form-label', 'Категории (можно выбрать несколько)'));
@@ -532,7 +565,7 @@
         }
 
         try {
-            es = new EventSource('/api/jobs/' + jobId + '/stream');
+            es = new EventSource('/api/jobs/' + jobId + '/stream?ws=' + encodeURIComponent(workspaceId));
             state.eventSource = es;
             es.onmessage = function(ev) {
                 try { finishCheck(JSON.parse(ev.data)); } catch (e) { /* игнорируем сбой парсинга */ }
@@ -930,8 +963,10 @@
     }
 
     // API для конструктора (js.js): bulk-добавление сгенерированных вопросов в квиз
+    // + ID рабочего пространства — для изоляции черновика квиза
     window.AIPanel = {
-        addAll: addAllToQuiz
+        addAll: addAllToQuiz,
+        workspaceId: workspaceId
     };
 
     if (document.readyState === 'loading') {

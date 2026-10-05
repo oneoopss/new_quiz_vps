@@ -12,10 +12,11 @@ class Store:
         self.db = db
 
     # ---------- job-ы ----------
-    def create_job(self, params: dict[str, Any]) -> int:
+    def create_job(self, params: dict[str, Any], workspace_id: str = "default") -> int:
         cur = self.db.execute(
-            "INSERT INTO jobs (status, params, progress) VALUES ('queued', ?, ?)",
-            (dumps(params), dumps({"stage": "queued", "done": 0, "total": 0, "message": ""})),
+            "INSERT INTO jobs (status, params, progress, workspace_id) VALUES ('queued', ?, ?, ?)",
+            (dumps(params), dumps({"stage": "queued", "done": 0, "total": 0, "message": ""}),
+             workspace_id or "default"),
         )
         return cur.lastrowid
 
@@ -44,6 +45,17 @@ class Store:
             job[key] = loads(job.get(key) or "{}", {})
         return job
 
+    def job_workspace(self, job_id: int) -> Optional[str]:
+        row = self.db.query_one("SELECT workspace_id FROM jobs WHERE id = ?", (job_id,))
+        return row["workspace_id"] if row else None
+
+    def latest_job(self, workspace_id: str) -> Optional[dict[str, Any]]:
+        row = self.db.query_one(
+            "SELECT id FROM jobs WHERE workspace_id = ? ORDER BY id DESC LIMIT 1",
+            (workspace_id or "default",),
+        )
+        return self.get_job(row["id"]) if row else None
+
     # ---------- логи ----------
     def log(self, job_id: Optional[int], stage: str, message: str, data: Optional[dict] = None) -> None:
         self.db.execute(
@@ -61,13 +73,14 @@ class Store:
         return result
 
     # ---------- вопросы ----------
-    def insert_question(self, q: QuestionRecord) -> int:
+    def insert_question(self, q: QuestionRecord, workspace_id: str = "default") -> int:
         cur = self.db.execute(
-            "INSERT INTO questions (job_id, text, explanation, options, source, knowledge_refs,"
-            " rationale, thinking_type, status, quality, generation_meta)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO questions (job_id, workspace_id, text, explanation, options, source,"
+            " knowledge_refs, rationale, thinking_type, status, quality, generation_meta)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 q.job_id,
+                workspace_id or "default",
                 q.text,
                 q.explanation,
                 dumps([o.model_dump() for o in q.options]),
@@ -125,34 +138,61 @@ class Store:
     def delete_question(self, question_id: int) -> None:
         self.db.execute("DELETE FROM questions WHERE id = ?", (question_id,))
 
-    def all_question_texts(self, exclude_job_id: Optional[int] = None) -> list[str]:
-        if exclude_job_id is None:
-            rows = self.db.query("SELECT text FROM questions")
-        else:
-            rows = self.db.query(
-                "SELECT text FROM questions WHERE job_id IS NULL OR job_id != ?", (exclude_job_id,))
-        return [r["text"] for r in rows]
+    def question_workspace(self, question_id: int) -> Optional[str]:
+        row = self.db.query_one("SELECT workspace_id FROM questions WHERE id = ?", (question_id,))
+        return row["workspace_id"] if row else None
 
-    def used_knowledge_ids(self) -> set[int]:
+    def all_question_texts(
+        self,
+        workspace_id: Optional[str] = None,
+        exclude_job_id: Optional[int] = None,
+    ) -> list[str]:
+        sql = "SELECT text FROM questions"
+        conds, params = [], []
+        if workspace_id is not None:
+            conds.append("workspace_id = ?")
+            params.append(workspace_id)
+        if exclude_job_id is not None:
+            conds.append("(job_id IS NULL OR job_id != ?)")
+            params.append(exclude_job_id)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        return [r["text"] for r in self.db.query(sql, params)]
+
+    def used_knowledge_ids(self, workspace_id: Optional[str] = None) -> set[int]:
         """Идентификаторы знаний, по которым уже есть вопросы (для ротации плана)."""
         used: set[int] = set()
-        for row in self.db.query("SELECT knowledge_refs FROM questions"):
+        if workspace_id is None:
+            rows = self.db.query("SELECT knowledge_refs FROM questions")
+        else:
+            rows = self.db.query(
+                "SELECT knowledge_refs FROM questions WHERE workspace_id = ?", (workspace_id,))
+        for row in rows:
             for kid in loads(row["knowledge_refs"] or "[]", []):
                 used.add(int(kid))
         return used
 
-    def previous_questions_for(self, knowledge_ids: list[int], limit: int = 2) -> list[str]:
+    def previous_questions_for(
+        self,
+        knowledge_ids: list[int],
+        workspace_id: Optional[str] = None,
+        limit: int = 2,
+    ) -> list[str]:
         """Прошлые вопросы по этим знаниям (чтобы генератор не повторял сюжет)."""
         if not knowledge_ids:
             return []
+        if workspace_id is None:
+            rows = self.db.query(
+                "SELECT text, knowledge_refs FROM questions ORDER BY id DESC LIMIT 30")
+        else:
+            rows = self.db.query(
+                "SELECT text, knowledge_refs FROM questions WHERE workspace_id = ?"
+                " ORDER BY id DESC LIMIT 30", (workspace_id,))
         texts: list[str] = []
-        for kid in knowledge_ids:
-            for row in self.db.query(
-                "SELECT text, knowledge_refs FROM questions ORDER BY id DESC LIMIT 30"
-            ):
-                refs = loads(row["knowledge_refs"] or "[]", [])
-                if kid in refs:
-                    texts.append(row["text"])
-                    if len([t for t in texts]) >= limit:
-                        return texts
+        for row in rows:
+            refs = loads(row["knowledge_refs"] or "[]", [])
+            if any(kid in refs for kid in knowledge_ids):
+                texts.append(row["text"])
+                if len(texts) >= limit:
+                    break
         return texts

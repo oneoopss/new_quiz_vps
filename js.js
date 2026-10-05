@@ -126,6 +126,13 @@
         }
     }
 
+    // Ключ черновика привязан к рабочему пространству (ai.js) —
+    // пространства кураторов не пересекаются; без AI-панели прежний ключ
+    function draftKey() {
+        var ws = (window.AIPanel && window.AIPanel.workspaceId) || '';
+        return ws ? 'quizBuilderData::' + ws : 'quizBuilderData';
+    }
+
     function saveQuiz(force) {
         // Страховка: квиз пуст, а в AI-панели есть сгенерированные вопросы
         if (!force && questions.length === 0 && window.AIPanel && window.AIPanel.addAll) {
@@ -137,8 +144,8 @@
         var title = quizTitleInput.value.trim() || 'Квиз';
         var data = { title: title, questions: questions };
         
-        // Сохраняем в localStorage для автовосстановления
-        localStorage.setItem('quizBuilderData', JSON.stringify(data));
+        // Сохраняем в localStorage (ключ рабочего пространства) для автовосстановления
+        localStorage.setItem(draftKey(), JSON.stringify(data));
         
         // Скачиваем JSON файл
         var blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
@@ -153,7 +160,7 @@
     }
 
     function loadFromLocalStorage() {
-        var saved = localStorage.getItem('quizBuilderData');
+        var saved = localStorage.getItem(draftKey());
         if (saved) {
             try {
                 var data = JSON.parse(saved);
@@ -169,7 +176,7 @@
     function saveToLocalStorage() {
         var title = quizTitleInput.value.trim() || 'Квиз';
         var data = { title: title, questions: questions };
-        localStorage.setItem('quizBuilderData', JSON.stringify(data));
+        localStorage.setItem(draftKey(), JSON.stringify(data));
     }
 
     function handleFileLoad(e) {
