@@ -177,23 +177,19 @@ async def run_generation_job(
     timeout = timeout_override if timeout_override is not None else max(
         settings.job_timeout_seconds, 120 + 90 * count)
 
-    def finish_failed(error: str) -> None:
+    def finish_failed(error: str, status: Optional[str] = None) -> None:
         # Частичные результаты: всё, что успело сохраниться, остаётся куратору (§16).
         saved = [q.id for q in store.questions_for_job(job_id) if q.id]
-        if saved:
-            store.update_job(
-                job_id, status="partial", error=error,
-                result={**counters, "question_ids": saved, "count": len(saved),
-                        "requested": count, "partial": True},
-            )
-            store.log(job_id, "error", f"{error}. Сохранено частичных вопросов: {len(saved)}")
-        else:
-            store.update_job(
-                job_id, status="failed", error=error,
-                result={**counters, "question_ids": [], "count": 0,
-                        "requested": count, "partial": False},
-            )
-            store.log(job_id, "error", f"Job failed: {error}")
+        final_status = status or ("partial" if saved else "failed")
+        store.update_job(
+            job_id, status=final_status, error=error,
+            result={**counters, "question_ids": saved, "count": len(saved),
+                    "requested": count, "partial": bool(saved)},
+        )
+        store.log(
+            job_id, "api" if final_status == "cancelled" else "error",
+            f"{error}. Сохранено вопросов: {len(saved)}",
+        )
 
     try:
         store.update_job(job_id, status="running")
@@ -201,6 +197,8 @@ async def run_generation_job(
             _run_stages(store, kb, job_id, section_codes, count, counting, settings, level, counters),
             timeout=timeout,
         )
+    except asyncio.CancelledError:
+        finish_failed("Остановлено пользователем", status="cancelled")
     except asyncio.TimeoutError:
         finish_failed("Превышен общий таймаут генерации")
     except Exception as exc:  # noqa: BLE001 — job всегда завершается терминальным статусом

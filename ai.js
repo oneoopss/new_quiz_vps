@@ -105,7 +105,7 @@
     }
 
     // ---------- панель ----------
-    var panel, categoriesBox, countInput, primaryBtn, refreshBtn, progressEl, resultsEl, statusEl, stateBox;
+    var panel, categoriesBox, countInput, primaryBtn, refreshBtn, cancelBtn, progressEl, resultsEl, statusEl, stateBox;
 
     function buildPanel() {
         var root = document.getElementById('aiPanelRoot');
@@ -165,6 +165,12 @@
         primaryBtn.id = 'aiPrimaryBtn';
         panel.appendChild(primaryBtn);
 
+        // Аварийная остановка всех фоновых процессов (извлечение, генерация, обновление)
+        cancelBtn = el('button', 'btn btn-danger btn-block', '⏹ Остановить все процессы');
+        cancelBtn.id = 'aiCancelBtn';
+        cancelBtn.style.marginTop = '.6rem';
+        panel.appendChild(cancelBtn);
+
         progressEl = el('div', 'ai-progress');
         progressEl.innerHTML = '<div class="ai-progress-text"></div><div class="ai-progress-bar"><i></i></div>';
         panel.appendChild(progressEl);
@@ -176,6 +182,7 @@
 
         primaryBtn.addEventListener('click', onPrimary);
         refreshBtn.addEventListener('click', onRefreshKnowledge);
+        cancelBtn.addEventListener('click', onCancelAll);
     }
 
     // ---------- категории / статус KB ----------
@@ -255,13 +262,14 @@
                 '. Можно генерировать уже сейчас — знания выбранной категории извлекутся приоритетно.';
             action = 'generate';
             label = '✨ Сгенерировать вопросы';
-        } else if (job && (job.status === 'failed' || job.status === 'partial')) {
+        } else if (job && (job.status === 'failed' || job.status === 'partial' || job.status === 'cancelled')) {
             var wasGenerate = (job.params && job.params.type) === 'generate';
             tone = 'error';
-            text = '⚠️ ' + (wasGenerate ? 'Последняя генерация' : 'Последняя задача') +
-                ' завершилась с ошибкой: ' + (job.error || 'неизвестная ошибка') +
-                (job.result && job.result.count
-                    ? ' Готовые вопросы сохранены ниже.' : '');
+            text = (job.status === 'cancelled'
+                ? '⚠️ Остановлено пользователем'
+                : '⚠️ ' + (wasGenerate ? 'Последняя генерация' : 'Последняя задача') +
+                  ' завершилась с ошибкой: ' + (job.error || 'неизвестная ошибка')) +
+                (job.result && job.result.count ? ' Готовые вопросы сохранены ниже.' : '');
             if (!docs) {
                 action = 'prepare';
                 label = '📚 Подготовить документацию';
@@ -339,6 +347,22 @@
             hideProgress();
             renderStatus();
             toast(err.message, 'error');
+        });
+    }
+
+    // ---------- остановка всех фоновых процессов ----------
+    function onCancelAll() {
+        cancelBtn.disabled = true;
+        api('/api/jobs/cancel', { method: 'POST' }).then(function(res) {
+            var n = (res.cancelled_job_ids || []).length;
+            toast(n ? 'Процессы остановлены (' + n + ')' : 'Активных процессов не было', 'info');
+            hideProgress();
+            renderStatus();
+            loadSections().then(followLatestJob);
+        }).catch(function(err) {
+            toast(err.message, 'error');
+        }).then(function() {
+            cancelBtn.disabled = false;
         });
     }
 
@@ -490,6 +514,15 @@
                 if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
                 if (es) es.close();
                 onDone(job);
+            } else if (job.status === 'cancelled') {
+                finished = true;
+                if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+                if (es) es.close();
+                if (job.result && job.result.count) {
+                    onDone(job);  // частичные вопросы показываем как результат
+                } else {
+                    onError('Остановлено пользователем');
+                }
             } else if (job.status === 'failed') {
                 finished = true;
                 if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
@@ -872,10 +905,13 @@
                     if (isGenerate) loadResults(job.id, job);
                     toast('Задача завершилась с ошибкой: ' + err, 'error');
                 });
-            } else if (isGenerate && (job.status === 'completed' || job.status === 'partial')) {
-                loadResults(job.id, job);
+            } else if (isGenerate && (job.status === 'completed' || job.status === 'partial' || job.status === 'cancelled')) {
+                if (job.result && job.result.count) loadResults(job.id, job);
                 if (job.status === 'partial') {
                     toast('Прошлая генерация завершилась частично — вопросы сохранены', 'warning');
+                }
+                if (job.status === 'cancelled') {
+                    toast('Прошлая генерация была остановлена — частичные вопросы показаны ниже', 'warning');
                 }
             } else if (isGenerate && job.status === 'failed' && job.result && job.result.count) {
                 loadResults(job.id, job);

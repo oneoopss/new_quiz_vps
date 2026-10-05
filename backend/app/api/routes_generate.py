@@ -15,6 +15,7 @@ from ..knowledge.base import KnowledgeBase
 from ..llm.provider import get_provider
 from ..models import GenerateRequest, RefreshRequest
 from ..store import Store
+from ..tasks import cancel_all, spawn
 
 router = APIRouter(prefix="/api", tags=["generate"])
 
@@ -34,8 +35,26 @@ async def start_generation(req: GenerateRequest) -> dict[str, Any]:
     async def _run() -> None:
         await run_generation_job(store, kb, job_id, codes, req.count, level=req.level)
 
-    asyncio.create_task(_run())
+    spawn(job_id, _run())
     return {"job_id": job_id}
+
+
+@router.post("/jobs/cancel")
+async def cancel_jobs() -> dict[str, Any]:
+    """Останавливает ВСЕ фоновые процессы (извлечение, генерация, обновление, подготовку).
+
+    Уже сохранённые частичные вопросы остаются в базе; после остановки можно
+    сразу запускать заново.
+    """
+    cancelled = cancel_all()
+    # «Сгребаем» зависшие job-ы без живой задачи (например, после перезапуска сервера)
+    store = Store(get_db())
+    for row in get_db().query("SELECT id FROM jobs WHERE status IN ('running', 'queued')"):
+        if row["id"] not in cancelled:
+            cancelled.append(row["id"])
+        store.update_job(row["id"], status="cancelled", error="Остановлено пользователем")
+        store.log(row["id"], "api", "Остановлено пользователем")
+    return {"cancelled_job_ids": cancelled}
 
 
 @router.get("/jobs/latest")
@@ -105,11 +124,14 @@ async def start_ingest(limit: int | None = None) -> dict[str, Any]:
             stats = await run_ingest(kb, store, limit=limit, job_id=job_id, report=report)
             report.finish("Ингест завершён")
             store.update_job(job_id, status="completed", result=stats)
+        except asyncio.CancelledError:
+            store.update_job(job_id, status="cancelled", error="Остановлено пользователем")
+            store.log(job_id, "api", "Ингест остановлен пользователем")
         except Exception as exc:  # noqa: BLE001
             store.update_job(job_id, status="failed", error=str(exc))
             store.log(job_id, "error", f"Ingest failed: {exc}")
 
-    asyncio.create_task(_run())
+    spawn(job_id, _run())
     return {"job_id": job_id}
 
 
@@ -137,6 +159,10 @@ async def prepare_documentation() -> dict[str, Any]:
             stats = await run_ingest(kb, store, extract=False, job_id=job_id, report=report)
             report.finish("Документация скачана")
             store.update_job(job_id, status="completed", result=stats)
+        except asyncio.CancelledError:
+            store.update_job(job_id, status="cancelled", error="Остановлено пользователем")
+            store.log(job_id, "api", "Подготовка остановлена пользователем")
+            return
         except Exception as exc:  # noqa: BLE001
             store.update_job(job_id, status="failed", error=str(exc))
             store.log(job_id, "error", f"Prepare failed: {exc}")
@@ -155,11 +181,14 @@ async def prepare_documentation() -> dict[str, Any]:
             )
             er.finish("Знания извлечены")
             store.update_job(extract_job, status="completed", result=estats)
+        except asyncio.CancelledError:
+            store.update_job(extract_job, status="cancelled", error="Остановлено пользователем")
+            store.log(extract_job, "api", "Извлечение знаний остановлено пользователем")
         except Exception as exc:  # noqa: BLE001
             store.update_job(extract_job, status="failed", error=str(exc))
             store.log(extract_job, "error", f"Extract failed: {exc}")
 
-    asyncio.create_task(_run())
+    spawn(job_id, _run())
     return {"job_id": job_id,
             "message": "Скачивание началось; извлечение знаний запустится после него"}
 
@@ -203,9 +232,12 @@ async def refresh_knowledge(req: RefreshRequest) -> dict[str, Any]:
             )
             report.finish("Знания обновлены")
             store.update_job(job_id, status="completed", result=stats)
+        except asyncio.CancelledError:
+            store.update_job(job_id, status="cancelled", error="Остановлено пользователем")
+            store.log(job_id, "api", "Переизвлечение остановлено пользователем")
         except Exception as exc:  # noqa: BLE001
             store.update_job(job_id, status="failed", error=str(exc))
             store.log(job_id, "error", f"Refresh failed: {exc}")
 
-    asyncio.create_task(_run())
+    spawn(job_id, _run())
     return {"job_id": job_id}

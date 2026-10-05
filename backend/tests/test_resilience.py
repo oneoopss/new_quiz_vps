@@ -1,6 +1,8 @@
 """Тесты устойчивости: partial-результаты, добор, повтор батча, breakdown."""
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app.api.routes_generate import get_latest_job
@@ -140,6 +142,45 @@ def test_failed_batch_reports_error_details(seeded_kb, store):
     assert "нет сети" in job["error"]  # причина видна куратору и в логах
     assert job["result"]["batch_errors"] >= 1
     assert any("нет сети" in e for e in job["result"]["batch_errors_detail"])
+
+
+def test_cancel_stops_generation(seeded_kb, store):
+    """Остановка: идущая генерация отменяется, job получает статус cancelled."""
+    from app import tasks
+    from app.generation.pipeline import run_generation_job
+
+    provider = FakeLLMProvider()
+    provider.set("PLANNER", {"plan": []})
+    provider.delays["GENERATE"] = 0.5  # генерация «виснет» — успеваем отменить
+    provider.set("GENERATE", {"questions": [make_question_dict(
+        "Как применить правило в нестандартной ситуации?", [0])]})
+    provider.set("CRITIC", {"reviews": [{"id": 0, "verdict": "accept"}]})
+
+    async def scenario():
+        job_id = store.create_job({"type": "generate", "section_codes": ["3.10.2"], "count": 1})
+        tasks.spawn(job_id, run_generation_job(
+            store, seeded_kb, job_id, "3.10.2", 1, provider=provider))
+        await asyncio.sleep(0.15)
+        cancelled = tasks.cancel_all()
+        await asyncio.sleep(0.1)
+        return job_id, cancelled
+
+    job_id, cancelled = run(scenario())
+    assert job_id in cancelled
+    job = store.get_job(job_id)
+    assert job["status"] == "cancelled"
+    assert "Остановлено" in job["error"]
+
+
+def test_cancel_endpoint_sweeps_stale_jobs(store):
+    """Зависшие running-джобы без живой задачи тоже останавливаются — можно перезапускать."""
+    from app.api.routes_generate import cancel_jobs
+
+    jid = store.create_job({"type": "generate", "section_codes": ["1.1"], "count": 1})
+    store.update_job(jid, status="running")
+    res = run(cancel_jobs())
+    assert jid in res["cancelled_job_ids"]
+    assert store.get_job(jid)["status"] == "cancelled"
 
 
 def test_routes_import_provider():
