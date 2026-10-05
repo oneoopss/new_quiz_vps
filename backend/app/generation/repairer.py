@@ -6,7 +6,7 @@ from typing import Any
 from ..llm.prompts import DEFAULT_LEVEL, REPAIR_SYSTEM, with_level
 from ..llm.provider import LLMError, LLMProvider
 from ..models import OptionModel, RawQuestion
-from .generator import attach_basis
+from .generator import attach_basis, shuffle_options
 
 
 def _parse(data: Any, original: RawQuestion) -> RawQuestion | None:
@@ -26,6 +26,7 @@ def _parse(data: Any, original: RawQuestion) -> RawQuestion | None:
             )
     if not text or not (2 <= len(options) <= 6):
         return None
+    options = shuffle_options(options, text)  # верный ответ — в случайную позицию
     clause = original.clause
     return RawQuestion(
         text=text,

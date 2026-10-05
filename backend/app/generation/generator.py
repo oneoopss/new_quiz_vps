@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
+import zlib
 from typing import Any
 
 from ..llm.prompts import DEFAULT_LEVEL, GENERATOR_SYSTEM, with_level
@@ -23,6 +25,21 @@ def strip_basis(explanation: str) -> str:
     return re.sub(r"\s*Основание:\s*п\.\s*[0-9][0-9.\-]*[0-9a-zа-яё]?\.?\s*$", "", explanation or "").strip()
 
 
+def shuffle_options(options: list[OptionModel], seed_text: str) -> list[OptionModel]:
+    """Случайная позиция правильного ответа: перемешивает варианты детерминированно.
+
+    LLM почти всегда ставит верный ответ первым — квиз получается с подсказкой.
+    Сид берётся из текста вопроса: порядок стабилен для одного и того же вопроса,
+    но у разных вопросов правильный ответ оказывается на разных позициях.
+    """
+    if len(options) < 2:
+        return list(options)
+    rng = random.Random(zlib.crc32((seed_text or "").encode("utf-8")))
+    shuffled = list(options)
+    rng.shuffle(shuffled)
+    return shuffled
+
+
 def _to_raw(item: dict[str, Any], plan_item: dict[str, Any] | None) -> RawQuestion | None:
     text = str(item.get("text", "")).strip()
     if not text:
@@ -39,6 +56,7 @@ def _to_raw(item: dict[str, Any], plan_item: dict[str, Any] | None) -> RawQuesti
                     isCorrect=bool(opt.get("is_correct", opt.get("isCorrect", False))),
                 )
             )
+    options = shuffle_options(options, text)  # верный ответ — в случайную позицию
     knowledge = (plan_item or {}).get("knowledge") or {}
     clause = str(knowledge.get("clause", "") or item.get("clause", "")).strip()
     explanation = attach_basis(str(item.get("explanation", "")).strip(), clause)
